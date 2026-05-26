@@ -16,6 +16,7 @@ import concurrent.futures
 import threading
 import time
 
+import os
 import pytest
 from google.api_core import exceptions
 
@@ -547,5 +548,58 @@ def test_sequential_cache_priming_multi_region(
         assert bucket_name in attrs["gcp.resource.destination.id"]
         # Multi-region location must be 'global'
         assert attrs["gcp.resource.destination.location"] == "global"
+    finally:
+        storage_client._bucket_metadata_cache.update_cache = original_update
+
+
+def test_disable_bucket_md_env_flag(storage_client, exporter, buckets_to_delete):
+    """Verifies that setting DISABLE_BUCKET_MD_IN_OTEL=true disables GCS destination annotations, even on cache hits."""
+    bucket_name = _helpers.unique_name("aco-disable")
+    bucket = storage_client.bucket(bucket_name)
+    storage_client.create_bucket(bucket)
+    buckets_to_delete.append(bucket)
+
+    blob_name = "test_blob.txt"
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string("hello")
+
+    # Setup deterministic event-driven synchronization hooks to prime the cache first
+    original_update = storage_client._bucket_metadata_cache.update_cache
+    update_cache_event = threading.Event()
+
+    def monitored_update(*args, **kwargs):
+        original_update(*args, **kwargs)
+        update_cache_event.set()
+
+    storage_client._bucket_metadata_cache.update_cache = monitored_update
+
+    try:
+        # Clear cache and OTel exporter logs
+        storage_client._bucket_metadata_cache.clear()
+        exporter.clear()
+
+        # First download to trigger cache miss and spawn background warming thread
+        blob.download_as_bytes()
+        assert update_cache_event.wait(timeout=10.0)
+        assert storage_client._bucket_metadata_cache.get(bucket_name) is not None
+
+        # Enable the DISABLE_BUCKET_MD_IN_OTEL environment variable
+        os.environ["DISABLE_BUCKET_MD_IN_OTEL"] = "true"
+
+        try:
+            # Second download (normally would be a cache hit with annotations)
+            exporter.clear()
+            blob.download_as_bytes()
+
+            # Verify that ACO attributes are NOT present in the OTel span!
+            spans = exporter.get_finished_spans()
+            dl_spans = [s for s in spans if s.name == "Storage.Blob.downloadAsBytes"]
+            assert len(dl_spans) == 1
+            attrs = dl_spans[0].attributes
+            assert "gcp.resource.destination.id" not in attrs
+            assert "gcp.resource.destination.location" not in attrs
+        finally:
+            # Restore env var
+            os.environ.pop("DISABLE_BUCKET_MD_IN_OTEL", None)
     finally:
         storage_client._bucket_metadata_cache.update_cache = original_update
